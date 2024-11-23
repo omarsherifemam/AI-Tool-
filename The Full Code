@@ -1,0 +1,435 @@
+import tensorflow as tf
+tf.compat.v1.enable_eager_execution()
+
+print(f"TensorFlow version: {tf.version}")
+print(f"Eager execution enabled: {tf.executing_eagerly()}")
+
+import pandas as pd
+import numpy as np
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input, Embedding, Dense, Dropout, LayerNormalization, MultiHeadAttention, Layer
+)
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, TensorBoard
+from sklearn.model_selection import train_test_split
+import datetime
+import random
+import matplotlib.pyplot as plt
+import pickle
+import re
+import tkinter as tk
+from tkinter import scrolledtext, messagebox
+import os
+import torch
+from transformers import AutoModel, AutoTokenizer
+from Bio.Seq import Seq
+import warnings
+warnings.filterwarnings('ignore')
+
+def load_data(excel_path, sheet_name=0, max_rows=None):
+    try:
+        df = pd.read_excel(excel_path, sheet_name=sheet_name)
+        print(f"Columns in the Excel file: {df.columns.tolist()}")
+        print(df.head())
+        if 'Sequence' not in df.columns:
+            raise ValueError("Excel file must contain a 'Sequence' column.")
+        df = df[['Sequence']].dropna()
+        if max_rows:
+            df = df.head(max_rows)
+        df.reset_index(drop=True, inplace=True)
+        print(f"Loaded {len(df)} sequences from the Excel file.")
+        df['Protein'] = df['Sequence'].apply(lambda x: str(Seq(x).translate(to_stop=True)))
+        return df
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        raise
+
+def add_space_to_sequence(sequence):
+    return ' '.join([sequence[i:i+3] for i in range(0, len(sequence), 3)])
+
+def introduce_realistic_mutations(codons, mutation_rate=0.05, min_codon_length=3, max_attempts=10):
+    nucleotides = ['A', 'T', 'C', 'G']
+    attempts = 0
+    while True:
+        mutated_codons = []
+        for codon in codons:
+            mutated_codon = list(codon)
+            for i in range(len(mutated_codon)):
+                if random.random() < mutation_rate:
+                    mutated_codon[i] = random.choice([nuc for nuc in nucleotides if nuc != mutated_codon[i]])
+            if random.random() < mutation_rate:
+                insertion_index = random.randint(0, len(mutated_codon))
+                mutated_codon.insert(insertion_index, random.choice(nucleotides))
+            if random.random() < mutation_rate and len(mutated_codon) > 1:
+                deletion_index = random.randint(0, len(mutated_codon) - 1)
+                del mutated_codon[deletion_index]
+            mutated_codons.append(''.join(mutated_codon))
+        if len(mutated_codons) >= min_codon_length or attempts >= max_attempts:
+            break
+        attempts += 1
+    return mutated_codons
+
+def preprocess_sequences(df, mutation_rate=0.05, min_codon_length=3):
+    df['Sequence_with_spaces'] = df['Sequence'].apply(add_space_to_sequence)
+    codon_sequences = [seq.split(' ') for seq in df['Sequence_with_spaces'].values]
+    print("Introducing mutations to sequences...")
+    bad_sequences = []
+    for idx, seq in enumerate(codon_sequences):
+        mutated_seq = introduce_realistic_mutations(seq, mutation_rate, min_codon_length)
+        bad_sequences.append(mutated_seq)
+        if (idx + 1) % 100 == 0 or (idx + 1) == len(codon_sequences):
+            print(f"Processed {idx + 1}/{len(codon_sequences)} sequences.")
+    flat_good_sequences = [' '.join(seq) for seq in codon_sequences]
+    flat_bad_sequences = [' '.join(seq) for seq in bad_sequences]
+    tokenizer = tf.keras.preprocessing.text.Tokenizer(char_level=False, lower=False)
+    tokenizer.fit_on_texts(flat_good_sequences + flat_bad_sequences)
+    tokenized_good_sequences = tokenizer.texts_to_sequences(flat_good_sequences)
+    tokenized_bad_sequences = tokenizer.texts_to_sequences(flat_bad_sequences)
+    protein_sequences = df['Protein'].values
+    return tokenizer, tokenized_good_sequences, tokenized_bad_sequences, protein_sequences
+
+def filter_zero_length_sequences(tokenized_good, tokenized_bad, protein_sequences):
+    filtered_good = []
+    filtered_bad = []
+    filtered_protein = []
+    for idx, (good_seq, bad_seq, prot_seq) in enumerate(zip(tokenized_good, tokenized_bad, protein_sequences)):
+        if len(good_seq) > 0 and len(bad_seq) > 0:
+            filtered_good.append(good_seq)
+            filtered_bad.append(bad_seq)
+            filtered_protein.append(prot_seq)
+    print(f"Filtered to {len(filtered_good)} sequences after removing zero-length sequences.")
+    return filtered_good, filtered_bad, filtered_protein
+
+def determine_max_sequence_length(tokenized_sequences, percentile=95):
+    sequence_lengths = [len(seq) for seq in tokenized_sequences]
+    max_sequence_length = int(np.percentile(sequence_lengths, percentile))
+    print(f"Determined max_sequence_length as the {percentile}th percentile: {max_sequence_length}")
+    return max_sequence_length
+
+def pad_sequences_custom(tokenized_sequences, max_sequence_length):
+    return tf.keras.preprocessing.sequence.pad_sequences(
+        tokenized_sequences, maxlen=max_sequence_length, padding='post', truncating='post', dtype='int32')
+
+def get_protein_embeddings(protein_sequences, esm_model, esm_tokenizer, embeddings_cache_path=None):
+    if embeddings_cache_path and os.path.exists(embeddings_cache_path):
+        print("Loading cached protein embeddings...")
+        embeddings = np.load(embeddings_cache_path)
+        return embeddings
+    print("Generating ESM-2 embeddings for protein sequences...")
+    esm_model.eval()
+    if torch.cuda.is_available():
+        esm_model.to('cuda')
+        print("Using GPU for ESM-2 embeddings.")
+    else:
+        esm_model.to('cpu')
+        print("Using CPU for ESM-2 embeddings.")
+    embeddings = []
+    for idx, seq in enumerate(protein_sequences):
+        esm_max_length = 1022
+        inputs = esm_tokenizer(
+            seq,
+            return_tensors="pt",
+            truncation=True,
+            padding='max_length',
+            max_length=esm_max_length
+        )
+        device = next(esm_model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = esm_model(**inputs, output_hidden_states=True)
+            hidden_states = outputs.hidden_states[-1]
+            attention_mask = inputs['attention_mask'].unsqueeze(-1)
+            masked_hidden_states = hidden_states * attention_mask
+            sum_hidden = masked_hidden_states.sum(dim=1)
+            total_tokens = attention_mask.sum(dim=1)
+            embedding = (sum_hidden / total_tokens).squeeze().cpu().numpy()
+            embeddings.append(embedding)
+        if (idx + 1) % 100 == 0 or (idx + 1) == len(protein_sequences):
+            print(f"Processed {idx + 1}/{len(protein_sequences)} protein sequences.")
+    embeddings = np.array(embeddings)
+    print(f"Generated embeddings shape: {embeddings.shape}")
+    if embeddings_cache_path:
+        np.save(embeddings_cache_path, embeddings)
+    return embeddings
+
+class TransformerBlock(tf.keras.layers.Layer):
+    def _init_(self, embed_dim=128, num_heads=4, ff_dim=512, rate=0.1, activity_regularizer=None, **kwargs):
+        super(TransformerBlock, self)._init_(**kwargs)
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.ff_dim = ff_dim
+        self.rate = rate
+        self.activity_regularizer = activity_regularizer  # Added this line
+        self.supports_masking = True
+        self.att = MultiHeadAttention(num_heads=self.num_heads, key_dim=self.embed_dim)
+        self.ffn = tf.keras.Sequential(
+            [Dense(self.ff_dim, activation='relu'), Dense(self.embed_dim)]
+        )
+        self.layernorm1 = LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = LayerNormalization(epsilon=1e-6)
+        self.dropout1 = Dropout(self.rate)
+        self.dropout2 = Dropout(self.rate)
+
+    def call(self, inputs, training=None, mask=None):
+        attn_output = self.att(inputs, inputs, inputs, training=training, attention_mask=mask)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(inputs + attn_output)
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        return self.layernorm2(out1 + ffn_output)
+
+    def get_config(self):
+        config = super(TransformerBlock, self).get_config()
+        config.update({
+            'embed_dim': self.embed_dim,
+            'num_heads': self.num_heads,
+            'ff_dim': self.ff_dim,
+            'rate': self.rate,
+            'activity_regularizer': self.activity_regularizer,
+        })
+        return config
+
+
+def create_model(vocab_size, max_sequence_length, protein_embedding_dim):
+    decoder_embed_dim = 128
+    num_heads = 4
+    ff_dim = 512
+    num_layers = 2
+    dropout_rate = 0.1
+
+    protein_inputs = Input(shape=(protein_embedding_dim,), name="protein_embeddings")
+    protein_projection = Dense(decoder_embed_dim, activation='relu', name='protein_projection')(protein_inputs)
+    repeated_protein_embeddings = tf.keras.layers.RepeatVector(max_sequence_length)(protein_projection)
+
+    decoder_inputs = Input(shape=(max_sequence_length,), name="decoder_inputs")
+    decoder_embedding = Embedding(input_dim=vocab_size, output_dim=decoder_embed_dim, mask_zero=True)(decoder_inputs)
+
+    positions = tf.range(start=0, limit=max_sequence_length, delta=1)
+    position_embeddings = Embedding(input_dim=max_sequence_length, output_dim=decoder_embed_dim)(positions)
+
+    x = decoder_embedding + position_embeddings + repeated_protein_embeddings
+
+    for _ in range(num_layers):
+        x = TransformerBlock(embed_dim=decoder_embed_dim, num_heads=num_heads, ff_dim=ff_dim, rate=dropout_rate)(x)
+
+    outputs = Dense(vocab_size, activation='softmax')(x)
+
+    model = Model(inputs=[protein_inputs, decoder_inputs], outputs=outputs)
+
+    optimizer = Adam(learning_rate=0.0005, clipnorm=1.0)
+    model.compile(optimizer=optimizer,
+                  loss='sparse_categorical_crossentropy',
+                  metrics=['sparse_categorical_accuracy'])
+
+    return model
+
+import heapq
+
+def beam_search_decoder(predictions, beam_width=3):
+    sequences = [([], 0.0)]
+    for row in predictions[0]:
+        all_candidates = []
+        for seq, score in sequences:
+            for j in range(len(row)):
+                candidate = (seq + [j], score - np.log(row[j] + 1e-8))
+                all_candidates.append(candidate)
+        sequences = heapq.nsmallest(beam_width, all_candidates, key=lambda tup: tup[1])
+    return sequences
+
+def correct_sequence_gui(input_text_widget, output_text_widget, tokenizer, model, max_sequence_length, index_to_codon, esm_tokenizer, esm_model):
+    user_input = input_text_widget.get("1.0", tk.END).strip().upper()
+    if not user_input:
+        messagebox.showwarning("Input Error", "Please enter a protein sequence to optimize.")
+        return
+    if not re.fullmatch(r'[A-Z]+', user_input):
+        messagebox.showwarning("Input Error", "Invalid sequence. Please enter a valid protein sequence.")
+        return
+    try:
+        esm_max_length = 1022
+        device = next(esm_model.parameters()).device
+        inputs = esm_tokenizer(
+            user_input,
+            return_tensors="pt",
+            truncation=True,
+            padding='max_length',
+            max_length=esm_max_length
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = esm_model(**inputs, output_hidden_states=True)
+            hidden_states = outputs.hidden_states[-1]
+            attention_mask = inputs['attention_mask'].unsqueeze(-1)
+            masked_hidden_states = hidden_states * attention_mask
+            sum_hidden = masked_hidden_states.sum(dim=1)
+            total_tokens = attention_mask.sum(dim=1)
+            protein_embedding = (sum_hidden / total_tokens).squeeze().cpu().numpy()
+        decoder_input = [0]
+        output_tokens = []
+        for _ in range(max_sequence_length):
+            decoder_input_padded = tf.keras.preprocessing.sequence.pad_sequences(
+                [decoder_input], maxlen=max_sequence_length, padding='post'
+            )
+            predicted_probs = model.predict([protein_embedding.reshape(1, -1), decoder_input_padded], verbose=0)
+            next_token_probs = predicted_probs[0, len(decoder_input)-1]
+            next_token = np.argmax(next_token_probs)
+            if next_token == 0:
+                break
+            output_tokens.append(next_token)
+            decoder_input.append(next_token)
+        predicted_codon_sequence = []
+        for token in output_tokens:
+            codon = index_to_codon.get(token, '')
+            if codon:
+                predicted_codon_sequence.append(codon)
+        optimized_sequence = ''.join(predicted_codon_sequence)
+        output_text_widget.delete("1.0", tk.END)
+        output_text_widget.insert(tk.END, f"Optimized DNA Sequence:\n{optimized_sequence}")
+    except Exception as e:
+        messagebox.showerror("Processing Error", f"An error occurred during processing:\n{e}")
+
+def create_gui(tokenizer, model, max_sequence_length, index_to_codon, flat_protein_sequences, esm_tokenizer, esm_model):
+    window = tk.Tk()
+    window.title("Protein to Optimized DNA Sequence App")
+    window.geometry('800x600')
+    input_label = tk.Label(window, text="Enter a protein sequence:")
+    input_label.pack(pady=(10, 0))
+    input_text_widget = scrolledtext.ScrolledText(window, wrap=tk.WORD, width=80, height=10)
+    input_text_widget.pack(pady=(5, 10))
+    correct_button = tk.Button(
+        window,
+        text="Generate Optimized DNA Sequence",
+        command=lambda: correct_sequence_gui(
+            input_text_widget, output_text_widget, tokenizer, model, max_sequence_length, index_to_codon, esm_tokenizer, esm_model
+        )
+    )
+    correct_button.pack(pady=10)
+    output_label = tk.Label(window, text="Output:")
+    output_label.pack(pady=(20, 0))
+    output_text_widget = scrolledtext.ScrolledText(window, wrap=tk.WORD, width=80, height=15)
+    output_text_widget.pack(pady=(5, 10))
+    window.mainloop()
+
+def main():
+    # Update the excel_path variable to the correct path of your Excel file
+    excel_path = r"C:\Users\bhdtr\Desktop\Database 2.xlsx"
+
+    # Check if the file exists
+    if not os.path.exists(excel_path):
+        print(f"Excel file not found at {excel_path}. Please check the path and try again.")
+        return
+
+    tokenizer_path = "toke1nizer_gene4.pkl"
+    tokenized_good_sequences_path = "tokenized_3good_sequences2.pkl"
+    tokenized_bad_sequences_path = "tokeni24zed_bad_sequences2.pkl"
+    protein_embeddings_path = "protein_emb3e24ddings2.npy"
+    max_sequence_length_path = "max_se24quence_leng34th2.npy"
+    model_path = "trained_mo2344del_gene2.keras"
+
+    print("Loading ESM-2 model and tokenizer...")
+    esm_model_name = "facebook/esm2_t6_8M_UR50D"
+    esm_tokenizer = AutoTokenizer.from_pretrained(esm_model_name)
+    esm_model = AutoModel.from_pretrained(esm_model_name)
+
+    if (os.path.exists(tokenizer_path) and 
+        os.path.exists(tokenized_good_sequences_path) and 
+        os.path.exists(tokenized_bad_sequences_path) and 
+        os.path.exists(protein_embeddings_path)):
+        print("Loading preprocessed data...")
+        with open(tokenizer_path, 'rb') as handle:
+            tokenizer = pickle.load(handle)
+        with open(tokenized_good_sequences_path, 'rb') as f:
+            tokenized_good_sequences = pickle.load(f)
+        with open(tokenized_bad_sequences_path, 'rb') as f:
+            tokenized_bad_sequences = pickle.load(f)
+        protein_embeddings = np.load(protein_embeddings_path)
+        df = load_data(excel_path, sheet_name=0)
+    else:
+        df = load_data(excel_path, sheet_name=0)
+        tokenizer, tokenized_good_sequences, tokenized_bad_sequences, protein_sequences = preprocess_sequences(
+            df, mutation_rate=0.05, min_codon_length=3
+        )
+        tokenized_good_sequences, tokenized_bad_sequences, protein_sequences = filter_zero_length_sequences(
+            tokenized_good_sequences, tokenized_bad_sequences, protein_sequences
+        )
+        with open(tokenizer_path, 'wb') as handle:
+            pickle.dump(tokenizer, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        with open(tokenized_good_sequences_path, 'wb') as f:
+            pickle.dump(tokenized_good_sequences, f, protocol=pickle.HIGHEST_PROTOCOL)
+        with open(tokenized_bad_sequences_path, 'wb') as f:
+            pickle.dump(tokenized_bad_sequences, f, protocol=pickle.HIGHEST_PROTOCOL)
+        protein_embeddings = get_protein_embeddings(protein_sequences, esm_model, esm_tokenizer, protein_embeddings_path)
+
+    if os.path.exists(max_sequence_length_path):
+        max_sequence_length = int(np.load(max_sequence_length_path))
+    else:
+        max_sequence_length = determine_max_sequence_length(
+            tokenized_good_sequences + tokenized_bad_sequences, percentile=95
+        )
+        np.save(max_sequence_length_path, max_sequence_length)
+
+    print("Padding sequences...")
+    padded_good_sequences = pad_sequences_custom(tokenized_good_sequences, max_sequence_length)
+    padded_bad_sequences = pad_sequences_custom(tokenized_bad_sequences, max_sequence_length)
+
+    print("Preparing datasets...")
+    X_train, X_val, y_train, y_val, prot_train, prot_val = train_test_split(
+        padded_bad_sequences, padded_good_sequences, protein_embeddings, test_size=0.2, random_state=42
+    )
+
+    y_train = y_train.astype(np.int32)
+    y_val = y_val.astype(np.int32)
+
+    batch_size = 32
+    train_dataset = tf.data.Dataset.from_tensor_slices(((prot_train, X_train), y_train))
+    train_dataset = train_dataset.cache().shuffle(buffer_size=1024).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    val_dataset = tf.data.Dataset.from_tensor_slices(((prot_val, X_val), y_val))
+    val_dataset = val_dataset.cache().batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    if os.path.exists(model_path):
+        print("Loading the trained model...")
+        custom_objects = {'TransformerBlock': TransformerBlock}
+        model = tf.keras.models.load_model(model_path, custom_objects=custom_objects)
+    else:
+        print("Creating and compiling the model...")
+        vocab_size = len(tokenizer.word_index) + 1
+        protein_embedding_dim = protein_embeddings.shape[1]
+        model = create_model(vocab_size, max_sequence_length, protein_embedding_dim)
+        model.summary()
+
+        early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-6)
+        log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        tensorboard_callback = TensorBoard(log_dir=log_dir, histogram_freq=1, write_graph=False)
+
+        print("Starting training...")
+        history = model.fit(
+            train_dataset,
+            validation_data=val_dataset,
+            epochs=5,
+            callbacks=[early_stopping, reduce_lr, tensorboard_callback],
+            verbose=1
+        )
+
+        model.save(model_path)
+
+        print("Evaluating the model on validation data...")
+        test_loss, test_accuracy = model.evaluate(val_dataset)
+        print(f"Validation Loss: {test_loss:.4f}")
+        print(f"Validation Accuracy: {test_accuracy:.4f}")
+
+    index_to_codon = {v: k for k, v in tokenizer.word_index.items()}
+    flat_protein_sequences = df['Protein'].tolist()
+
+    esm_model.eval()
+    if torch.cuda.is_available():
+        esm_model.to('cuda')
+    else:
+        esm_model.to('cpu')
+
+    print("Launching the GUI...")
+    create_gui(tokenizer, model, max_sequence_length, index_to_codon, flat_protein_sequences, esm_tokenizer, esm_model)
+
+if _name_ == '_main_':
+    main()
